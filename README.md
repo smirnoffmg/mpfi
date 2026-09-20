@@ -1,4 +1,4 @@
-# pypi-package-uv-template
+# mpfi
 
 A GitHub repository template for Python packages using [uv](https://docs.astral.sh/uv/), with ruff, mypy, pytest, pre-commit, MkDocs (API docs via mkdocstrings), GitHub Pages, and automatic PyPI release via trusted publishing.
 
@@ -14,11 +14,11 @@ make rename DIST_NAME=my-tool MODULE_NAME=my_tool
 
 Then run `uv sync`, `uv run pytest`, and `uv run ruff check .` to confirm everything works.
 
-**Manual alternative** — replace `pypi-package-uv-template` and `pypi_package_uv_template` everywhere:
+**Manual alternative** — replace `mpfi` and `mpfi` everywhere:
 
 | Location                                 | Change                                                                            |
 | ---------------------------------------- | --------------------------------------------------------------------------------- |
-| **Rename directory**                     | `src/pypi_package_uv_template/` → `src/<your_module>/` (e.g. `src/my_package/`)   |
+| **Rename directory**                     | `src/mpfi/` → `src/<your_module>/` (e.g. `src/my_package/`)   |
 | [pyproject.toml](pyproject.toml)         | `name = "..."` (PyPI name); `[tool.mypy]` → `packages = ["src/<your_module>"]`    |
 | Python files in `src/`                   | Imports and any string that mentions the old name (e.g. the `print` in `main.py`) |
 | [tests/test_main.py](tests/test_main.py) | `from <your_module> import ...` and the assertion text                            |
@@ -44,7 +44,7 @@ Python 3.12+ is required (see [.python-version](.python-version)). uv will use i
 ## Usage
 
 ```bash
-python -m pypi_package_uv_template
+python -m mpfi
 ```
 
 ## Development

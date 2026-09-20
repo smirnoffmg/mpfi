@@ -1,4 +1,4 @@
-# pypi-package-uv-template
+# mpfi
 
 Add your description here.
 
@@ -12,7 +12,7 @@ uv sync
 ## Usage
 
 ```bash
-python -m pypi_package_uv_template
+python -m mpfi
 ```
 
 ## Documentation

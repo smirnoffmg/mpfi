@@ -1,6 +1,6 @@
 # API Reference
 
-::: pypi_package_uv_template
+::: mpfi
     options:
       show_root_heading: true
       members: true

@@ -3,12 +3,18 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pypi-package-uv-template"
+name = "mpfi"
 version = "0.1.0"
-description = "Add your description here"
+description = "Static index of structural fragility in tabular ML pipelines"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["pycg-ml"]
+
+[project.scripts]
+mpfi = "mpfi.components:main"
+
+[tool.uv.sources]
+pycg-ml = { git = "https://github.com/smirnoffmg/pycg-ml" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -39,7 +45,8 @@ python_version = "3.12"
 warn_return_any = true
 warn_unused_ignores = true
 disallow_untyped_defs = false
-packages = ["src/pypi_package_uv_template"]
+mypy_path = "src"
+packages = ["mpfi"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
