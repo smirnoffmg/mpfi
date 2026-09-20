@@ -65,20 +65,26 @@ def test_coupling_counts_the_edges_between_feature_nodes(pipeline):
 
 
 def test_a_contract_on_the_boundary_raises_coverage(tmp_path):
-    without = components_for_source(tmp_path / "a", textwrap.dedent("""
+    without = components_for_source(
+        tmp_path / "a",
+        textwrap.dedent("""
         import pandas as pd
 
         def load(path):
             return pd.read_csv(path)
-    """))
-    with_hint = components_for_source(tmp_path / "b", textwrap.dedent("""
+    """),
+    )
+    with_hint = components_for_source(
+        tmp_path / "b",
+        textwrap.dedent("""
         import pandas as pd
 
         def load(path: str) -> pd.DataFrame:
             frame = pd.read_csv(path)
             assert not frame.empty
             return frame
-    """))
+    """),
+    )
 
     assert with_hint.scc > without.scc
 

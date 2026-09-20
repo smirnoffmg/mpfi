@@ -11,14 +11,11 @@ into one index needs the sample, and belongs to the analysis rather than here.
 """
 
 import ast
-import contextlib
-import io
 from dataclasses import dataclass
 from pathlib import Path
 
-from pycg_ml.generator import CallGraphGenerator
-from pycg_ml.ml_patterns import ml_edges
-from pycg_ml.utils import constants
+from mpfi.patterns import ml_edges
+from mpfi.static_graph import call_graph
 
 # Calls that reshape a table rather than merely read from it.
 TRANSFORM_CALLS = frozenset(
@@ -95,7 +92,7 @@ class Components:
 def components(package: Path) -> Components:
     """Measure one package; an empty or unparsable package scores zero."""
     modules = dict(_modules(package))
-    graph = _call_graph(package)
+    graph = call_graph(package)
     features = _feature_nodes(modules, graph)
     covered, total = _boundary_coverage(modules)
     return Components(
@@ -130,23 +127,6 @@ def _module_name(path: Path, package: Path) -> str:
     if parts and parts[-1] == "__init__":
         parts = parts[:-1]
     return ".".join(parts)
-
-
-def _call_graph(package: Path) -> dict[str, set[str]]:
-    entries = sorted(str(p) for p in package.rglob("*.py"))
-    if not entries:
-        return {}
-    generator = CallGraphGenerator(entries, str(package), -1, constants.CALL_GRAPH_OP)
-    try:
-        with (
-            contextlib.redirect_stdout(io.StringIO()),
-            contextlib.redirect_stderr(io.StringIO()),
-        ):
-            generator.analyze()
-            graph: dict[str, set[str]] = generator.output()
-            return graph
-    except Exception:
-        return {}
 
 
 def _feature_nodes(

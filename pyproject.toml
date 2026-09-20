@@ -8,13 +8,10 @@ version = "0.1.0"
 description = "Static index of structural fragility in tabular ML pipelines"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["pycg-ml"]
+dependencies = []
 
 [project.scripts]
 mpfi = "mpfi.components:main"
-
-[tool.uv.sources]
-pycg-ml = { git = "https://github.com/smirnoffmg/pycg-ml" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
