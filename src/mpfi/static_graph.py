@@ -35,11 +35,15 @@ def call_graph_for_source(source: str, module: str) -> dict[str, set[str]]:
     except (SyntaxError, ValueError):
         return {}
 
+    # Built once per module: rebuilding them per lookup made the pass quadratic.
+    imports = _imports(tree)
+    defined = _definitions(tree, module)
+
     graph: dict[str, set[str]] = {}
     for scope, node in _scopes(tree, module):
         callees = set()
         for call in _calls_directly_in(node):
-            target = _resolve(call.func, scope, tree, module)
+            target = _resolve(call.func, scope, imports, defined)
             if target:
                 callees.add(target)
         if callees:
@@ -91,31 +95,32 @@ def _calls_directly_in(node: ast.AST) -> list[ast.Call]:
     return found
 
 
-def _resolve(func: ast.expr, scope: str, tree: ast.Module, module: str) -> str | None:
+def _resolve(
+    func: ast.expr, scope: str, imports: dict[str, str], defined: set[str]
+) -> str | None:
     if isinstance(func, ast.Name):
-        return _lookup(func.id, scope, tree, module)
+        return _lookup(func.id, scope, imports, defined)
     if isinstance(func, ast.Attribute):
-        base = _resolve_value(func.value, scope, tree, module)
+        base = _resolve_value(func.value, scope, imports, defined)
         return f"{base}.{func.attr}" if base else None
     return None
 
 
 def _resolve_value(
-    node: ast.expr, scope: str, tree: ast.Module, module: str
+    node: ast.expr, scope: str, imports: dict[str, str], defined: set[str]
 ) -> str | None:
     if isinstance(node, ast.Name):
-        return _lookup(node.id, scope, tree, module)
+        return _lookup(node.id, scope, imports, defined)
     if isinstance(node, ast.Attribute):
-        base = _resolve_value(node.value, scope, tree, module)
+        base = _resolve_value(node.value, scope, imports, defined)
         return f"{base}.{node.attr}" if base else None
     return None
 
 
-def _lookup(name: str, scope: str, tree: ast.Module, module: str) -> str | None:
+def _lookup(
+    name: str, scope: str, imports: dict[str, str], defined: set[str]
+) -> str | None:
     """Innermost enclosing definition wins; then imports; then nothing."""
-    imports = _imports(tree)
-    defined = _definitions(tree, module)
-
     parts = scope.split(".")
     while parts:
         candidate = ".".join([*parts, name])
