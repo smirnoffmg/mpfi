@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from mpfi.patterns import ml_edges
-from mpfi.static_graph import call_graph
+from mpfi.static_graph import call_graph, source_files
 
 # Calls that reshape a table rather than merely read from it.
 TRANSFORM_CALLS = frozenset(
@@ -113,7 +113,7 @@ def components_for_source(directory: Path, source: str) -> Components:
 
 def _modules(package: Path) -> list[tuple[str, ast.Module]]:
     found = []
-    for path in sorted(package.rglob("*.py")):
+    for path in source_files(package):
         try:
             tree = ast.parse(path.read_text(errors="replace"))
         except (OSError, SyntaxError, ValueError):

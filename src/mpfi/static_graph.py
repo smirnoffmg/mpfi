@@ -17,6 +17,24 @@ from mpfi.patterns import ml_edges
 
 MAX_BASE_DEPTH = 10
 
+# A test exercises the pipeline without being part of it, so it says nothing
+# about how the pipeline itself is wired.
+TEST_DIRECTORIES = frozenset({"test", "tests", "testing"})
+
+
+def is_test_path(path: Path) -> bool:
+    name = path.name
+    return (
+        any(part in TEST_DIRECTORIES for part in path.parts)
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+        or name == "conftest.py"
+    )
+
+
+def source_files(package: Path) -> list[Path]:
+    return [p for p in sorted(package.rglob("*.py")) if not is_test_path(p)]
+
 
 @dataclass(frozen=True)
 class _Names:
@@ -35,7 +53,7 @@ def call_graph(package: Path) -> dict[str, set[str]]:
     definitions are collected from every module before any call is resolved.
     """
     modules = []
-    for path in sorted(package.rglob("*.py")):
+    for path in source_files(package):
         try:
             source = path.read_text(errors="replace")
             tree = ast.parse(source)

@@ -91,3 +91,29 @@ def test_a_contract_on_the_boundary_raises_coverage(tmp_path):
 
 def test_coverage_is_a_share(pipeline):
     assert 0.0 <= pipeline.scc <= 1.0
+
+
+def test_the_test_suite_is_not_part_of_the_pipeline(tmp_path):
+    """A test calling a transform is checking it, not coupling to it."""
+    from mpfi.components import components
+
+    package = tmp_path / "pkg"
+    (package / "tests").mkdir(parents=True)
+    (package / "steps.py").write_text(
+        textwrap.dedent("""
+        def add_ratio(df):
+            return df.assign(ratio=1)
+    """)
+    )
+    (package / "tests" / "test_steps.py").write_text(
+        textwrap.dedent("""
+        from steps import add_ratio
+
+        def test_add_ratio(df):
+            return add_ratio(df)
+    """)
+    )
+
+    result = components(package)
+
+    assert not any(node.startswith("tests.") for node in result.feature_nodes)
