@@ -137,8 +137,8 @@ def test_a_variable_holding_a_fresh_instance_carries_its_class():
     assert "main.Scaler.transform" in result["main.run"]
 
 
-def test_a_variable_assigned_twice_is_left_alone():
-    """Two candidates mean guessing, and guessing is what this graph avoids."""
+def test_a_variable_assigned_twice_reaches_both_classes():
+    """A call graph would rather be over-cautious than lose an edge."""
     result = graph("""
         class A:
             def run(self):
@@ -154,8 +154,7 @@ def test_a_variable_assigned_twice_is_left_alone():
             return x.run()
     """)
 
-    assert "main.A.run" not in result.get("main.main", set())
-    assert "main.B.run" not in result.get("main.main", set())
+    assert {"main.A.run", "main.B.run"} <= result["main.main"]
 
 
 def test_a_relative_import_is_resolved_against_its_package(tmp_path):
@@ -244,3 +243,59 @@ def test_an_attribute_holding_a_fresh_instance_is_followed_across_methods():
     """)
 
     assert "main.Scaler.transform" in result["main.Model.apply"]
+
+
+def test_a_factory_reaches_every_class_it_can_return():
+    """`get_encoder(name)` picks one of several; the graph keeps all of them."""
+    result = graph("""
+        class FrequencyEncoder:
+            def fit_transform(self, df):
+                return df
+
+        class TargetEncoder:
+            def fit_transform(self, df):
+                return df
+
+        def get_encoder(name):
+            if name == "frequency":
+                return FrequencyEncoder()
+            return TargetEncoder()
+
+        def run(df):
+            encoder = get_encoder("frequency")
+            return encoder.fit_transform(df)
+    """)
+
+    assert {
+        "main.FrequencyEncoder.fit_transform",
+        "main.TargetEncoder.fit_transform",
+    } <= result["main.run"]
+
+
+def test_a_factory_that_returns_a_variable_is_followed():
+    """The usual shape: pick a class into a local, return the local."""
+    result = graph("""
+        class FrequencyEncoder:
+            def fit_transform(self, df):
+                return df
+
+        class TargetEncoder:
+            def fit_transform(self, df):
+                return df
+
+        def get_encoder(name):
+            if name == "frequency":
+                encoder = FrequencyEncoder()
+            if name == "target":
+                encoder = TargetEncoder()
+            return encoder
+
+        def run(df):
+            encoder = get_encoder("frequency")
+            return encoder.fit_transform(df)
+    """)
+
+    assert {
+        "main.FrequencyEncoder.fit_transform",
+        "main.TargetEncoder.fit_transform",
+    } <= result["main.run"]

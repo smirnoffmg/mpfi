@@ -43,7 +43,8 @@ class _Names:
     imports: dict[str, str]
     defined: set[str]
     bases: dict[str, list[str]]
-    attributes: dict[str, dict[str, str]]
+    attributes: dict[str, dict[str, set[str]]]
+    returns: dict[str, set[str]]
 
 
 def call_graph(package: Path) -> dict[str, set[str]]:
@@ -69,16 +70,35 @@ def call_graph(package: Path) -> dict[str, set[str]]:
     bases: dict[str, list[str]] = {}
     for module, _, tree in modules:
         lookup = _Names(
-            imports=imports[module], defined=defined, bases={}, attributes={}
+            imports=imports[module],
+            defined=defined,
+            bases={},
+            attributes={},
+            returns={},
         )
         bases.update(_bases(tree, module, lookup))
 
-    attributes: dict[str, dict[str, str]] = {}
+    attributes: dict[str, dict[str, set[str]]] = {}
     for module, _, tree in modules:
         known = _Names(
-            imports=imports[module], defined=defined, bases=bases, attributes={}
+            imports=imports[module],
+            defined=defined,
+            bases=bases,
+            attributes={},
+            returns={},
         )
         attributes.update(_attributes(tree, module, known))
+
+    returns: dict[str, set[str]] = {}
+    for module, _, tree in modules:
+        known = _Names(
+            imports=imports[module],
+            defined=defined,
+            bases=bases,
+            attributes={},
+            returns={},
+        )
+        returns.update(_returns(tree, module, known))
 
     graph: dict[str, set[str]] = {}
     for module, source, tree in modules:
@@ -87,6 +107,7 @@ def call_graph(package: Path) -> dict[str, set[str]]:
             defined=defined,
             bases=bases,
             attributes=attributes,
+            returns=returns,
         )
         for caller, callees in _graph_of(tree, source, module, names).items():
             graph.setdefault(caller, set()).update(callees)
@@ -110,9 +131,7 @@ def _graph_of(
         instances = _local_instances(node, scope, names)
         callees = set()
         for call in _calls_directly_in(node):
-            target = _resolve(call.func, scope, names, instances)
-            if target:
-                callees.add(target)
+            callees |= _resolve(call.func, scope, names, instances)
         if callees:
             graph.setdefault(scope, set()).update(callees)
 
@@ -124,14 +143,19 @@ def _graph_of(
 def _names_of(tree: ast.Module, module: str) -> _Names:
     imports = _imports(tree, module)
     defined = _definitions(tree, module)
-    lookup = _Names(imports=imports, defined=defined, bases={}, attributes={})
+    lookup = _Names(
+        imports=imports, defined=defined, bases={}, attributes={}, returns={}
+    )
     bases = _bases(tree, module, lookup)
-    known = _Names(imports=imports, defined=defined, bases=bases, attributes={})
+    known = _Names(
+        imports=imports, defined=defined, bases=bases, attributes={}, returns={}
+    )
     return _Names(
         imports=imports,
         defined=defined,
         bases=bases,
         attributes=_attributes(tree, module, known),
+        returns=_returns(tree, module, known),
     )
 
 
@@ -176,35 +200,44 @@ def _calls_directly_in(node: ast.AST) -> list[ast.Call]:
     return found
 
 
-def _local_instances(node: ast.AST, scope: str, names: _Names) -> dict[str, str]:
-    """Variables handed a fresh instance: `scaler = Scaler()`.
+def _local_instances(node: ast.AST, scope: str, names: _Names) -> dict[str, set[str]]:
+    """Variables handed an instance: `scaler = Scaler()`, `enc = get_encoder(n)`.
 
-    A name assigned more than once, or assigned anything else, is dropped —
-    picking one of two candidates would be a guess.
+    A name assigned twice holds either, and a factory holds any class it can
+    return; the graph keeps every candidate rather than lose an edge.
     """
-    seen: dict[str, str | None] = {}
+    held: dict[str, set[str]] = {}
     for child in ast.walk(node):
         if not isinstance(child, ast.Assign) or len(child.targets) != 1:
             continue
         target = child.targets[0]
-        if not isinstance(target, ast.Name):
-            continue
-        cls = None
-        if isinstance(child.value, ast.Call):
-            resolved = _resolve_name(child.value.func, scope, names)
-            if resolved and resolved in names.bases:
-                cls = resolved
-        seen[target.id] = None if target.id in seen else cls
-    return {name: cls for name, cls in seen.items() if cls}
+        if isinstance(target, ast.Name):
+            held.setdefault(target.id, set()).update(
+                _candidates(child.value, scope, names)
+            )
+    return {name: classes for name, classes in held.items() if classes}
+
+
+def _candidates(value: ast.expr, scope: str, names: _Names) -> set[str]:
+    """Which classes an expression can hold: a constructor, or a factory's returns."""
+    if not isinstance(value, ast.Call):
+        return set()
+    resolved = _resolve_name(value.func, scope, names)
+    if not resolved:
+        return set()
+    if resolved in names.bases:
+        return {resolved}
+    return set(names.returns.get(resolved, set()))
 
 
 def _resolve(
-    func: ast.expr, scope: str, names: _Names, instances: dict[str, str]
-) -> str | None:
+    func: ast.expr, scope: str, names: _Names, instances: dict[str, set[str]]
+) -> set[str]:
     if isinstance(func, ast.Name):
-        return _lookup(func.id, scope, names)
+        found = _lookup(func.id, scope, names)
+        return {found} if found else set()
     if not isinstance(func, ast.Attribute):
-        return None
+        return set()
 
     receiver = func.value
     if (
@@ -213,19 +246,26 @@ def _resolve(
         and receiver.value.id == "self"
     ):
         owner = _enclosing_class(scope, names)
-        held = names.attributes.get(owner or "", {}).get(receiver.attr)
-        return _class_attribute(held, func.attr, names) if held else None
+        held = names.attributes.get(owner or "", {}).get(receiver.attr, set())
+        return _methods_of(held, func.attr, names)
     if _is_super_call(receiver):
         owner = _enclosing_class(scope, names)
-        return _base_attribute(owner, func.attr, names) if owner else None
+        found = _base_attribute(owner, func.attr, names) if owner else None
+        return {found} if found else set()
     if isinstance(receiver, ast.Name):
         if receiver.id == "self":
             owner = _enclosing_class(scope, names)
-            return _class_attribute(owner, func.attr, names) if owner else None
+            found = _class_attribute(owner, func.attr, names) if owner else None
+            return {found} if found else set()
         if receiver.id in instances:
-            return _class_attribute(instances[receiver.id], func.attr, names)
+            return _methods_of(instances[receiver.id], func.attr, names)
     base = _resolve_name(receiver, scope, names)
-    return f"{base}.{func.attr}" if base else None
+    return {f"{base}.{func.attr}"} if base else set()
+
+
+def _methods_of(classes: set[str], attr: str, names: _Names) -> set[str]:
+    found = {_class_attribute(cls, attr, names) for cls in classes}
+    return {name for name in found if name}
 
 
 def _resolve_name(node: ast.expr, scope: str, names: _Names) -> str | None:
@@ -239,9 +279,9 @@ def _resolve_name(node: ast.expr, scope: str, names: _Names) -> str | None:
 
 def _attributes(
     tree: ast.Module, module: str, known: _Names
-) -> dict[str, dict[str, str]]:
-    """Attributes handed a fresh instance: `self.scaler_ = StandardScaler()`."""
-    held: dict[str, dict[str, str]] = {}
+) -> dict[str, dict[str, set[str]]]:
+    """Attributes handed an instance: `self.scaler_ = StandardScaler()`."""
+    held: dict[str, dict[str, set[str]]] = {}
 
     def walk(node: ast.AST, scope: str) -> None:
         for child in ast.iter_child_nodes(node):
@@ -257,25 +297,57 @@ def _attributes(
     return held
 
 
-def _self_assignments(node: ast.ClassDef, cls: str, known: _Names) -> dict[str, str]:
-    found: dict[str, str | None] = {}
+def _self_assignments(
+    node: ast.ClassDef, cls: str, known: _Names
+) -> dict[str, set[str]]:
+    held: dict[str, set[str]] = {}
     for child in ast.walk(node):
         if not isinstance(child, ast.Assign) or len(child.targets) != 1:
             continue
         target = child.targets[0]
-        if not (
+        if (
             isinstance(target, ast.Attribute)
             and isinstance(target.value, ast.Name)
             and target.value.id == "self"
         ):
-            continue
-        held = None
-        if isinstance(child.value, ast.Call):
-            resolved = _resolve_name(child.value.func, cls, known)
-            if resolved and resolved in known.bases:
-                held = resolved
-        found[target.attr] = None if target.attr in found else held
-    return {name: cls_ for name, cls_ in found.items() if cls_}
+            held.setdefault(target.attr, set()).update(
+                _candidates(child.value, cls, known)
+            )
+    return {name: classes for name, classes in held.items() if classes}
+
+
+def _returns(tree: ast.Module, module: str, known: _Names) -> dict[str, set[str]]:
+    """Which classes a function hands back, for one level of indirection.
+
+    A factory returning another factory's result is not followed: the classes
+    of the inner one are not known while this map is being built.
+    """
+    found: dict[str, set[str]] = {}
+
+    def walk(node: ast.AST, scope: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                name = f"{scope}.{child.name}"
+                if not isinstance(child, ast.ClassDef):
+                    # A factory usually picks a class into a local and returns
+                    # the local, so returned names are looked up there.
+                    locals_ = _local_instances(child, name, known)
+                    classes: set[str] = set()
+                    for inner in ast.walk(child):
+                        if not isinstance(inner, ast.Return) or inner.value is None:
+                            continue
+                        if isinstance(inner.value, ast.Name):
+                            classes |= locals_.get(inner.value.id, set())
+                        else:
+                            classes |= _candidates(inner.value, name, known)
+                    if classes:
+                        found[name] = classes
+                walk(child, name)
+            else:
+                walk(child, scope)
+
+    walk(tree, module)
+    return found
 
 
 def _is_super_call(node: ast.expr) -> bool:
