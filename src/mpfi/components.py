@@ -71,6 +71,26 @@ IO_CALLS = frozenset(
     }
 )
 
+# A parameter named like this is handed a table, whether or not anyone says so.
+FRAME_PARAMETERS = frozenset(
+    {
+        "df",
+        "dframe",
+        "dataframe",
+        "frame",
+        "data",
+        "dataset",
+        "table",
+        "X",
+        "X_train",
+        "X_test",
+        "x",
+        "x_train",
+        "x_test",
+        "features",
+    }
+)
+
 # Markers that say what a frame is allowed to contain.
 CONTRACT_DECORATORS = frozenset(
     {"check_types", "check_input", "check_output", "validate_call"}
@@ -202,12 +222,36 @@ def _boundary_coverage(modules: dict[str, ast.Module]) -> tuple[int, int]:
     for _, tree in modules.items():
         for scope, node in _functions(tree, ""):
             io_calls = [c for c in ast.walk(node) if _is_io(c)]
-            if not io_calls:
+            # A library never reads a file: the table arrives as an argument,
+            # and that signature is where a contract would live.
+            points = len(io_calls) + int(_handles_table(node))
+            if not points:
                 continue
-            total += len(io_calls)
+            total += points
             if _has_contract(node):
-                covered += len(io_calls)
+                covered += points
     return covered, total
+
+
+def _handles_table(node: ast.AST) -> bool:
+    """Does this function work on a table? Asked without looking at annotations.
+
+    Reading the contract here would make every boundary covered by definition.
+    """
+    signature = getattr(node, "args", None)
+    if signature is None:
+        return False
+    parameters = {arg.arg for arg in signature.args}
+    if parameters & FRAME_PARAMETERS:
+        return True
+    return any(
+        isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Attribute)
+        and child.func.attr in TRANSFORM_CALLS
+        and isinstance(child.func.value, ast.Name)
+        and child.func.value.id in parameters
+        for child in ast.walk(node)
+    )
 
 
 def _is_io(node: ast.AST) -> bool:
