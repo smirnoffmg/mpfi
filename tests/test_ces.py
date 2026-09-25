@@ -121,3 +121,83 @@ def test_a_real_pipeline_reacts_to_the_column_it_depends_on():
     assert on_signal > 0.1
     assert on_decoy < 0.05
     assert on_signal > on_decoy * 5
+
+
+def test_a_fixed_split_varies_only_the_model_seed():
+    """The protocol randomises the split too; fixing it is an explicit choice."""
+    from mpfi.ces import fix_split
+
+    calls = []
+
+    def run(data, model_seed, split_seed):
+        calls.append((model_seed, split_seed))
+        return 0.5
+
+    fixed = fix_split(run, split_seed=7)
+    fixed(pd.DataFrame(), 0)
+    fixed(pd.DataFrame(), 3)
+
+    assert calls == [(0, 7), (3, 7)]
+
+
+def test_a_perturbation_that_breaks_the_run_is_recorded_not_raised(frame):
+    from mpfi.ces import measure_model_sensitivity
+
+    def breaks_on_zeros(data, seed):
+        if (data["signal"] == 0).all():
+            raise ValueError("no signal left")
+        return float(data["signal"].mean()) / 4
+
+    measured = measure_model_sensitivity(
+        breaks_on_zeros, frame, ["signal"], seeds=[0, 1]
+    )
+
+    assert [failure.perturbation for failure in measured.failures] == [
+        "zero_fill(signal)"
+    ]
+    assert "ValueError: no signal left" in measured.failures[0].error
+    assert len(measured.shifts) == 2
+
+
+def test_a_failure_counts_as_a_full_loss_or_is_left_out(frame):
+    from mpfi.ces import measure_model_sensitivity
+
+    def breaks_on_zeros(data, seed):
+        if (data["signal"] == 0).all():
+            raise ValueError("no signal left")
+        return 0.8
+
+    measured = measure_model_sensitivity(breaks_on_zeros, frame, ["signal"], seeds=[0])
+
+    assert measured.score(max, failures="count_as_one") == 1.0
+    assert measured.score(max, failures="exclude") == 0.0
+
+
+def test_every_aggregation_is_reported_side_by_side(frame):
+    from mpfi.ces import Measurement, Shift
+
+    measured = Measurement(
+        baseline=1.0,
+        shifts=(Shift("a", 0.1), Shift("b", 0.2), Shift("c", 0.9)),
+        failures=(),
+    )
+
+    assert measured.scores() == pytest.approx({"median": 0.2, "mean": 0.4, "max": 0.9})
+
+
+def test_the_old_entry_point_still_returns_a_number(frame):
+    def reads_signal(data, seed):
+        return float(data["signal"].mean()) / 4
+
+    measured = model_sensitivity(reads_signal, frame, ["signal"], seeds=[0])
+
+    assert isinstance(measured, float)
+
+
+def test_the_old_entry_point_no_longer_stops_at_a_broken_run(frame):
+    def breaks_on_zeros(data, seed):
+        if (data["signal"] == 0).all():
+            raise ValueError("no signal left")
+        return 0.8
+
+    assert model_sensitivity(breaks_on_zeros, frame, ["signal"], seeds=[0]) >= 0.0
