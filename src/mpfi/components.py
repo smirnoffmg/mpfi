@@ -2,8 +2,11 @@
 
 Three components, each read off the source and the call graph:
 
-  * FCI, how tightly the feature-engineering functions are wired to each other;
-  * PDD, the longest chain of transformations data passes through;
+  * FCI, how tightly the feature-engineering functions are wired to each other:
+    calls between them and hand-offs of a table from one to the next, per function;
+  * PDD, the longest chain of feature-engineering steps a table passes through,
+    whether the chain is written as nested calls, a pipe, reassignments of one
+    variable or the steps of an sklearn pipeline;
   * SCC, the share of data boundaries that carry an explicit contract.
 
 They are reported raw. Normalising them against a stratum and weighting them
@@ -14,8 +17,8 @@ import ast
 from dataclasses import dataclass
 from pathlib import Path
 
-from mpfi.patterns import ml_edges
-from mpfi.static_graph import call_graph, source_files
+from mpfi.patterns import PIPE_METHODS
+from mpfi.static_graph import pipeline_graph, source_files
 
 # Calls that reshape a table rather than merely read from it.
 TRANSFORM_CALLS = frozenset(
@@ -112,8 +115,8 @@ class Components:
 def components(package: Path) -> Components:
     """Measure one package; an empty or unparsable package scores zero."""
     modules = dict(_modules(package))
-    graph = call_graph(package)
-    features = _feature_nodes(modules, graph)
+    graph, steps = pipeline_graph(package)
+    features = _feature_nodes(modules, steps)
     covered, total = _boundary_coverage(modules)
     return Components(
         fci=_coupling(graph, features),
@@ -149,17 +152,14 @@ def _module_name(path: Path, package: Path) -> str:
     return ".".join(parts)
 
 
-def _feature_nodes(
-    modules: dict[str, ast.Module], graph: dict[str, set[str]]
-) -> set[str]:
-    """A function is feature engineering if it reshapes a table or is handed one."""
-    nodes = set()
+def _feature_nodes(modules: dict[str, ast.Module], steps: set[str]) -> set[str]:
+    """A function is feature engineering if it reshapes a table or is a step
+    a pipeline hands one to."""
+    nodes = set(steps)
     for module, tree in modules.items():
         for scope, node in _functions(tree, module):
             if any(_is_transform(call) for call in ast.walk(node)):
                 nodes.add(scope)
-        for callees in ml_edges(ast.unparse(tree), module).values():
-            nodes.update(c for c in callees if c in graph or c.startswith(f"{module}."))
     return nodes
 
 
@@ -181,10 +181,12 @@ def _functions(tree: ast.Module, module: str) -> list[tuple[str, ast.AST]]:
 
 
 def _is_transform(node: ast.AST) -> bool:
+    # A pipe hands the table on without reshaping it; the steps it hands the
+    # table to are nodes themselves, and the function holding the pipe is not.
     return (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr in TRANSFORM_CALLS
+        and node.func.attr in TRANSFORM_CALLS - PIPE_METHODS
     )
 
 
@@ -214,7 +216,9 @@ def _depth(graph: dict[str, set[str]], features: set[str]) -> int:
         memo[node] = best
         return best
 
-    return max(longest(node, frozenset({node})) for node in features)
+    # Sorted: `memo` depends on the order nodes are visited in, and set order
+    # changes with the hash seed.
+    return max(longest(node, frozenset({node})) for node in sorted(features))
 
 
 def _boundary_coverage(modules: dict[str, ast.Module]) -> tuple[int, int]:

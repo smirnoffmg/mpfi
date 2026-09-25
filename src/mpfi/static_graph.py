@@ -7,15 +7,24 @@ left unresolved on purpose: two candidates mean guessing.
 
 Measured against a points-to analysis on the same repositories, this adds no
 false edges; what it used to lose were the calls a method makes through `self`.
+
+Beside the calls, the graph carries hand-offs: an edge from `a` to `b` when a
+value `a` returned is what `b` receives, as in `b(a(df))`, `df.pipe(a).pipe(b)`
+or `df = a(df)` followed by `b(df)`. A chain of transformations is written in any
+of these styles, and nested calls are only one of them.
 """
 
 import ast
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-from mpfi.patterns import ml_edges
+from mpfi.patterns import PIPE_METHODS, ml_edges
 
 MAX_BASE_DEPTH = 10
+
+# Where a table goes through an estimator, in the order a pipeline would call it.
+STEP_METHODS = ("transform", "fit_transform", "fit")
 
 # A test exercises the pipeline without being part of it, so it says nothing
 # about how the pipeline itself is wired.
@@ -48,7 +57,13 @@ class _Names:
 
 
 def call_graph(package: Path) -> dict[str, set[str]]:
-    """Resolve calls against the whole package, not one module at a time.
+    return pipeline_graph(package)[0]
+
+
+def pipeline_graph(package: Path) -> tuple[dict[str, set[str]], set[str]]:
+    """The graph, and the package's functions that ML patterns name as steps.
+
+    Calls resolve against the whole package, not one module at a time.
 
     A base class or an instantiated class usually lives in a sibling module, so
     definitions are collected from every module before any call is resolved.
@@ -101,7 +116,8 @@ def call_graph(package: Path) -> dict[str, set[str]]:
         returns.update(_returns(tree, module, known))
 
     graph: dict[str, set[str]] = {}
-    for module, source, tree in modules:
+    steps: set[str] = set()
+    for module, _, tree in modules:
         names = _Names(
             imports=imports[module],
             defined=defined,
@@ -109,9 +125,11 @@ def call_graph(package: Path) -> dict[str, set[str]]:
             attributes=attributes,
             returns=returns,
         )
-        for caller, callees in _graph_of(tree, source, module, names).items():
+        edges, found = _graph_of(tree, module, names)
+        for caller, callees in edges.items():
             graph.setdefault(caller, set()).update(callees)
-    return graph
+        steps |= found
+    return graph, steps
 
 
 def call_graph_for_source(source: str, module: str) -> dict[str, set[str]]:
@@ -120,12 +138,12 @@ def call_graph_for_source(source: str, module: str) -> dict[str, set[str]]:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return {}
-    return _graph_of(tree, source, module, _names_of(tree, module))
+    return _graph_of(tree, module, _names_of(tree, module))[0]
 
 
 def _graph_of(
-    tree: ast.Module, source: str, module: str, names: _Names
-) -> dict[str, set[str]]:
+    tree: ast.Module, module: str, names: _Names
+) -> tuple[dict[str, set[str]], set[str]]:
     graph: dict[str, set[str]] = {}
     for scope, node in _scopes(tree, module):
         instances = _local_instances(node, scope, names)
@@ -134,10 +152,112 @@ def _graph_of(
             callees |= _resolve(call.func, scope, names, instances)
         if callees:
             graph.setdefault(scope, set()).update(callees)
+        for producer, consumer in _hand_offs(node, scope, names, instances):
+            graph.setdefault(producer, set()).add(consumer)
 
-    for caller, callees in ml_edges(source, module).items():
+    steps: set[str] = set()
+    patterns = ml_edges(tree, module, lambda name: _step_node(name, names))
+    for caller, callees in patterns.items():
         graph.setdefault(caller, set()).update(callees)
-    return graph
+        steps |= callees & names.defined
+    return graph, steps
+
+
+def _step_node(name: str, names: _Names) -> str | None:
+    """The package's own function a pipeline step runs the table through."""
+    if name in names.bases:
+        for method in STEP_METHODS:
+            found = _class_attribute(name, method, names)
+            if found in names.defined:
+                return found
+        return None
+    return name if name in names.defined else None
+
+
+def _hand_offs(
+    node: ast.AST, scope: str, names: _Names, instances: dict[str, set[str]]
+) -> set[tuple[str, str]]:
+    """Which function's result each function of the package is handed.
+
+    Statements are read in source order and a variable remembers what produced
+    its value last; branches and loops are not told apart. A call into a library
+    or an unresolved method passes on what it was given, so `a(df).fillna(0)`
+    still carries `a` to whatever comes next.
+    """
+    edges: set[tuple[str, str]] = set()
+    held: dict[str, set[str]] = {}
+
+    def steps(func: ast.expr) -> set[str]:
+        resolved = _resolve(func, scope, names, instances)
+        return {c for c in resolved if c in names.defined and c not in names.bases}
+
+    def produced(expr: ast.AST) -> set[str]:
+        if isinstance(expr, ast.Name):
+            return set(held.get(expr.id, ()))
+        if not isinstance(expr, ast.Call):
+            return _union(produced(child) for child in ast.iter_child_nodes(expr))
+        func = expr.func
+        if isinstance(func, ast.Attribute) and func.attr in PIPE_METHODS and expr.args:
+            targets = steps(expr.args[0])
+            inputs = produced(func.value) | _union(
+                produced(child) for child in [*expr.args[1:], *expr.keywords]
+            )
+        else:
+            targets = steps(func)
+            inputs = _union(produced(child) for child in ast.iter_child_nodes(expr))
+        if not targets:
+            return inputs
+        edges.update((p, t) for p in inputs for t in targets if p != t)
+        return targets
+
+    def bind(target: ast.expr, value: set[str]) -> None:
+        if isinstance(target, ast.Name):
+            held[target.id] = value
+        elif isinstance(target, ast.Tuple | ast.List):
+            for element in target.elts:
+                bind(element, value)
+        elif isinstance(target, ast.Subscript):
+            base = target.value
+            while isinstance(base, ast.Subscript | ast.Attribute):
+                base = base.value
+            if isinstance(base, ast.Name):
+                held[base.id] = held.get(base.id, set()) | value
+
+    def visit(current: ast.AST) -> None:
+        if isinstance(current, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            return
+        if isinstance(current, ast.Assign):
+            value = produced(current.value)
+            for target in current.targets:
+                bind(target, value)
+        elif isinstance(current, ast.AnnAssign | ast.AugAssign):
+            if current.value is not None:
+                extra = (
+                    produced(current.target)
+                    if isinstance(current, ast.AugAssign)
+                    else set()
+                )
+                bind(current.target, produced(current.value) | extra)
+        elif isinstance(current, ast.For | ast.AsyncFor):
+            bind(current.target, produced(current.iter))
+            for statement in [*current.body, *current.orelse]:
+                visit(statement)
+        elif isinstance(current, ast.expr):
+            produced(current)
+        else:
+            for child in ast.iter_child_nodes(current):
+                visit(child)
+
+    for child in ast.iter_child_nodes(node):
+        visit(child)
+    return edges
+
+
+def _union(sets: Iterable[set[str]]) -> set[str]:
+    found: set[str] = set()
+    for part in sets:
+        found |= part
+    return found
 
 
 def _names_of(tree: ast.Module, module: str) -> _Names:

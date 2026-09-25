@@ -299,3 +299,54 @@ def test_a_factory_that_returns_a_variable_is_followed():
         "main.FrequencyEncoder.fit_transform",
         "main.TargetEncoder.fit_transform",
     } <= result["main.run"]
+
+
+def test_a_step_fed_by_another_step_is_linked_to_it():
+    """Data flow: whatever b receives, a produced; b(a(df)) and a pipe alike."""
+    result = graph("""
+        def a(df):
+            return df
+
+        def b(df):
+            return df
+
+        def composed(df):
+            return b(a(df))
+
+        def piped(df):
+            return df.pipe(a).pipe(b)
+    """)
+
+    assert result["main.a"] == {"main.b"}
+
+
+def test_a_value_carries_its_producer_through_a_variable():
+    result = graph("""
+        def a(df):
+            return df
+
+        def b(df):
+            return df
+
+        def run(df):
+            out = a(df)
+            out = out.fillna(0)
+            return b(out)
+    """)
+
+    assert result["main.a"] == {"main.b"}
+
+
+def test_steps_that_share_an_input_are_not_linked():
+    result = graph("""
+        def a(df):
+            return df
+
+        def b(df):
+            return df
+
+        def run(df):
+            return a(df), b(df)
+    """)
+
+    assert "main.a" not in result

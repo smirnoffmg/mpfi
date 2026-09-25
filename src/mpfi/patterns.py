@@ -5,24 +5,38 @@ Three shapes cover most of what a static call graph loses on such code:
   * a transform handed to ``DataFrame.pipe`` is called by the enclosing function,
     yet nothing in the source says so;
   * the steps of an sklearn pipeline live in a list of tuples and are dispatched
-    inside ``fit``;
+    inside ``fit``, each handing its output to the next;
   * a boosting library receives evaluation functions and callbacks as arguments.
 
 Each shape is recovered here as the edge the interpreter would follow at runtime.
 """
 
 import ast
+from collections.abc import Callable
+from dataclasses import dataclass
 
 PIPE_METHODS = frozenset({"pipe"})
 
-# name of the constructor -> whether the last step is an estimator (fit) or
-# another transform (fit_transform), which is what Pipeline.fit distinguishes.
 SEQUENTIAL_PIPELINES = frozenset(
     {"sklearn.pipeline.Pipeline", "sklearn.pipeline.make_pipeline"}
 )
 PARALLEL_PIPELINES = frozenset(
-    {"sklearn.compose.ColumnTransformer", "sklearn.pipeline.FeatureUnion"}
+    {
+        "sklearn.compose.ColumnTransformer",
+        "sklearn.compose.make_column_transformer",
+        "sklearn.pipeline.FeatureUnion",
+        "sklearn.pipeline.make_union",
+    }
 )
+# These take the steps as plain arguments; the classes take one list of them.
+SPREAD_PIPELINES = frozenset(
+    {
+        "sklearn.pipeline.make_pipeline",
+        "sklearn.pipeline.make_union",
+        "sklearn.compose.make_column_transformer",
+    }
+)
+FUNCTION_TRANSFORMERS = frozenset({"sklearn.preprocessing.FunctionTransformer"})
 
 BOOSTING_TRAINERS = frozenset(
     {"lightgbm.train", "xgboost.train", "catboost.train", "lightgbm.cv", "xgboost.cv"}
@@ -30,14 +44,32 @@ BOOSTING_TRAINERS = frozenset(
 
 STEPS_KEYWORDS = frozenset({"steps", "transformers", "transformer_list"})
 
+# Given the qualified name of a class or function used as a pipeline step, the
+# function of the analysed package that the table passes through, if any.
+StepNode = Callable[[str], str | None]
 
-def ml_edges(source: str, module: str) -> dict[str, set[str]]:
+
+@dataclass(frozen=True)
+class _Stage:
+    """Where a table enters a piece of pipeline, where it leaves, and between."""
+
+    entries: frozenset[str] = frozenset()
+    exits: frozenset[str] = frozenset()
+    edges: frozenset[tuple[str, str]] = frozenset()
+
+    def nodes(self) -> set[str]:
+        found = set(self.entries | self.exits)
+        for caller, callee in self.edges:
+            found |= {caller, callee}
+        return found
+
+
+def ml_edges(tree: ast.Module, module: str, step_node: StepNode) -> dict[str, set[str]]:
     """Return caller -> callees for the ML patterns found in one module."""
-    tree = ast.parse(source)
     names = _resolve_names(tree, module)
     edges: dict[str, set[str]] = {}
     for scope, node in _calls(tree, module):
-        for caller, callee in _edges_of_call(node, scope, names):
+        for caller, callee in _edges_of_call(node, scope, names, step_node):
             edges.setdefault(caller, set()).add(callee)
     return edges
 
@@ -75,18 +107,18 @@ def _calls(tree: ast.AST, module: str) -> list[tuple[str, ast.Call]]:
 
 
 def _edges_of_call(
-    node: ast.Call, scope: str, names: dict[str, str]
+    node: ast.Call, scope: str, names: dict[str, str], step_node: StepNode
 ) -> list[tuple[str, str]]:
     target = _qualify(node.func, names)
 
     if isinstance(node.func, ast.Attribute) and node.func.attr in PIPE_METHODS:
         return [(scope, callee) for callee in _callables(node.args[:1], names)]
 
-    if target in SEQUENTIAL_PIPELINES:
-        return _pipeline_edges(node, names, sequential=True)
-
-    if target in PARALLEL_PIPELINES:
-        return _pipeline_edges(node, names, sequential=False)
+    if target in SEQUENTIAL_PIPELINES | PARALLEL_PIPELINES:
+        stage = _stage(node, names, step_node)
+        # fit dispatches every step; each step then feeds the one after it.
+        fit = [(f"{target}.fit", step) for step in sorted(stage.nodes())]
+        return fit + sorted(stage.edges)
 
     if target in BOOSTING_TRAINERS:
         passed = [kw.value for kw in node.keywords] + node.args
@@ -95,49 +127,74 @@ def _edges_of_call(
     return []
 
 
-def _pipeline_edges(
-    node: ast.Call, names: dict[str, str], sequential: bool
-) -> list[tuple[str, str]]:
-    """Model what `fit` does: transform every step, then fit the estimator."""
-    owner = _qualify(node.func, names)
-    if owner is None:
-        return []
-    # make_pipeline takes the steps as plain arguments; the classes take a list.
-    steps = [_step_estimator(element, names) for element in _step_elements(node)]
-    resolved = [step for step in steps if step]
-    if not resolved:
-        return []
+def _stage(element: ast.expr, names: dict[str, str], step_node: StepNode) -> _Stage:
+    """One step: a nested pipeline, a function wrapped as a transformer, or a class.
 
-    caller = f"{owner}.fit"
-    if not sequential:
-        return [(caller, f"{step}.fit_transform") for step in resolved]
-    edges = [(caller, f"{step}.fit_transform") for step in resolved[:-1]]
-    edges.append((caller, f"{resolved[-1]}.fit"))
-    return edges
+    A step from a library resolves to nothing and is left out of the chain: the
+    steps on either side of it still hand the table to each other.
+    """
+    if isinstance(element, ast.Tuple):
+        # (name, step), (name, step, columns) or (step, columns)
+        element = next(
+            (e for e in element.elts if not isinstance(e, ast.Constant)), element
+        )
+    if not isinstance(element, ast.Call):
+        return _Stage()
+    target = _qualify(element.func, names)
+    if target in SEQUENTIAL_PIPELINES:
+        return _in_sequence(
+            [_stage(e, names, step_node) for e in _step_elements(element, target)]
+        )
+    if target in PARALLEL_PIPELINES:
+        return _in_parallel(
+            [_stage(e, names, step_node) for e in _step_elements(element, target)]
+        )
+    if target in FUNCTION_TRANSFORMERS:
+        passed = element.args[:1] + [
+            kw.value for kw in element.keywords if kw.arg == "func"
+        ]
+        target = next(iter(_callables(passed, names)), None)
+    node = step_node(target) if target else None
+    if node is None:
+        return _Stage()
+    return _Stage(frozenset({node}), frozenset({node}))
 
 
-def _step_elements(node: ast.Call) -> list[ast.expr]:
+def _in_sequence(stages: list[_Stage]) -> _Stage:
+    entries: frozenset[str] = frozenset()
+    exits: frozenset[str] = frozenset()
+    edges: set[tuple[str, str]] = set()
+    for stage in stages:
+        if not stage.entries:
+            continue
+        edges |= stage.edges
+        edges |= {(done, nxt) for done in exits for nxt in stage.entries}
+        entries = entries or stage.entries
+        exits = stage.exits
+    return _Stage(entries, exits, frozenset(edges))
+
+
+def _in_parallel(stages: list[_Stage]) -> _Stage:
+    return _Stage(
+        frozenset().union(*(s.entries for s in stages)),
+        frozenset().union(*(s.exits for s in stages)),
+        frozenset().union(*(s.edges for s in stages)),
+    )
+
+
+def _step_elements(node: ast.Call, target: str) -> list[ast.expr]:
+    if target in SPREAD_PIPELINES:
+        return list(node.args)
     for keyword in node.keywords:
         if keyword.arg in STEPS_KEYWORDS:
             return _unpack(keyword.value)
-    if node.args:
-        return _unpack(node.args[0]) or list(node.args)
-    return []
+    return _unpack(node.args[0]) if node.args else []
 
 
 def _unpack(value: ast.expr) -> list[ast.expr]:
     if isinstance(value, ast.List | ast.Tuple):
         return list(value.elts)
     return []
-
-
-def _step_estimator(element: ast.expr, names: dict[str, str]) -> str | None:
-    """A step is either a bare estimator or a (name, estimator, ...) tuple."""
-    if isinstance(element, ast.Tuple) and len(element.elts) >= 2:
-        element = element.elts[1]
-    if isinstance(element, ast.Call):
-        return _qualify(element.func, names)
-    return _qualify(element, names)
 
 
 def _callables(values: list[ast.expr], names: dict[str, str]) -> list[str]:
