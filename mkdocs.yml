@@ -1,6 +1,6 @@
 site_name: mpfi
-site_description: Add your description here
-site_url: https://github.com/owner/mpfi
+site_description: Static index of structural fragility in tabular ML pipelines
+site_url: https://smirnoffmg.github.io/mpfi/
 
 theme:
   name: material

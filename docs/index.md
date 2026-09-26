@@ -1,20 +1,19 @@
 # mpfi
 
-Add your description here.
+MPFI is a static index of structural fragility in tabular ML pipelines.
+CES is a perturbation harness used to validate it.
 
 ## Installation
 
 ```bash
 uv sync
-# or: pip install -e .
+pip install -e ".[ces]"  # CES only
 ```
 
 ## Usage
 
 ```bash
-python -m mpfi
+uv run mpfi path/to/repository
 ```
 
-## Documentation
-
-See [API Reference](api.md) for the public API.
+See the [API reference](api.md) for the public API.
