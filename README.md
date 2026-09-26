@@ -4,13 +4,20 @@ MPFI is a static index of structural fragility in tabular ML pipelines. CES is a
 
 ## MPFI
 
-`mpfi` parses a repository and reports three components:
+`mpfi` parses every module of the repository except tests and builds one graph over its functions. An edge `a → b` means one of three things:
 
-- FCI (Feature Coupling Index): calls and table hand-offs between feature-engineering functions, per function.
-- PDD (Pipeline Dependency Depth): the longest chain of feature-engineering steps a table passes through.
-- SCC (Schema Contract Coverage): the share of data boundaries with a schema contract.
+- `a` calls `b`. `df.pipe(b)` inside `a` counts as a call. Names are resolved through imports, `self`, inheritance and held instances. There is no points-to analysis, so `f = transform; f(df)` is not resolved.
+- The result of `a` is passed to `b`, as in `x = a(df); y = b(x)`, `b(a(df).fillna(0))` or `df.pipe(a).pipe(b)`. This is the data flow between functions.
+- `a` and `b` are consecutive steps of an sklearn `Pipeline`. A step is a package function wrapped in `FunctionTransformer` or a package class, represented by its `transform`, `fit_transform` or `fit` method. The branches of a `ColumnTransformer` or `FeatureUnion` are not linked to each other. Each branch takes the edge from the step before and gives one to the step after.
 
-The call graph is built from the AST without points-to analysis, so `f = transform; f(df)` is not resolved. Results are deterministic.
+A function is a feature-engineering node if it reshapes a table (`merge`, `groupby`, `fillna`, `fit_transform` and similar) or is used as a step: a pipeline step, a `.pipe` target, or a callback passed to `lightgbm.train` or `xgboost.train`. FCI and PDD are computed on the subgraph of these nodes:
+
+- FCI (Feature Coupling Index): edges between feature-engineering nodes divided by the number of such nodes.
+- PDD (Pipeline Dependency Depth): the number of functions on the longest path through feature-engineering nodes.
+
+SCC (Schema Contract Coverage) does not use the graph. It counts data boundaries in the AST (I/O calls such as `read_csv` or `to_parquet` inside a function, and functions that take a table) and reports the share that carry a contract: a `DataFrame` or schema annotation, a validating decorator, or an `assert`.
+
+The result does not depend on the hash seed.
 
 ```bash
 uv sync
