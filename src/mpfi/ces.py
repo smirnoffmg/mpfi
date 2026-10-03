@@ -91,13 +91,14 @@ AGGREGATES: dict[str, Aggregate] = {
 }
 
 FailureRule = Literal["count_as_one", "exclude"]
-# Not agreed with the supervisor; to be decided 26.09.2026. A run that breaks under
-# a disturbance has lost all its quality, which is what a shift of 1.0 says; leaving
-# it out would read the most fragile pipelines as the soundest.
+# Decided 03.10.2026 (protocol v2, decision 8): "count_as_one" is primary, "exclude"
+# a sensitivity check. A run that breaks under a disturbance has lost all its quality,
+# which is what a shift of 1.0 says; leaving it out would read the most fragile
+# pipelines as the soundest.
 DEFAULT_FAILURE_RULE: FailureRule = "count_as_one"
 
 EvaluationRule = Literal["separate", "exclude", "include"]
-# Not agreed with the supervisor; to be decided 26.09.2026. A sampler changes what
+# Decided 03.10.2026 (protocol v2, decision 7): "separate". A sampler changes what
 # the model is trained and, when the author resamples before splitting, scored on:
 # its disturbance measures the evaluation procedure, not the pipeline.
 DEFAULT_EVALUATION_RULE: EvaluationRule = "separate"
@@ -109,10 +110,12 @@ NoiseRule = Literal["subtract", "raw"]
 # A ratio would be undefined for a deterministic model, whose floor is zero.
 DEFAULT_NOISE_RULE: NoiseRule = "subtract"
 
-# Не согласовано, решение 26.09. A regression prediction counts as changed when it
+# Decided 03.10.2026 (protocol v2, decision 4); 0.05 and 0.2 are sensitivity checks.
+# A regression prediction counts as changed when it
 # moves by more than this share of the target's standard deviation.
 REGRESSION_TOLERANCE = 0.1
-# Не согласовано, решение 26.09. A predicted probability counts as changed when it
+# Decided 03.10.2026 (protocol v2, decision 4): a secondary outcome; the primary churn
+# of a classifier is the label one. A predicted probability counts as changed when it
 # moves by more than this, after the δ of Watson-Daniels et al. (2023).
 PROBABILITY_DELTA = 0.1
 
@@ -173,7 +176,11 @@ class Measurement:
         failures: FailureRule = DEFAULT_FAILURE_RULE,
         noise: NoiseRule = DEFAULT_NOISE_RULE,
     ) -> float:
-        """The median by default, as the design specifies; not agreed as final."""
+        """The median by default.
+
+        Protocol v2 pools perturbation types across the sample instead (decision 5),
+        so this per-pipeline score is a sensitivity check.
+        """
         observed = self.values(failures, noise)
         return aggregate(observed) if observed else 0.0
 
@@ -316,7 +323,7 @@ def model_sensitivity(
     perturbation, which is also its cost: a pipeline that survives most
     disturbances and collapses under one reads as sound. Sensitivity analysis
     is the place to try the alternatives, hence the argument; the median and the
-    failure rule are not agreed with the supervisor yet (decision 26.09.2026).
+    failure rule is fixed by protocol v2 (decision 8, 03.10.2026).
     """
     measured = measure_model_sensitivity(run, frame, columns, seeds, perturbations)
     return measured.score(aggregate, failures)
@@ -663,8 +670,8 @@ def measure_pipeline_propagation(
 
     Variants that disturb the evaluation procedure (a sampler) are, by the
     `evaluation` rule: reported apart and kept out of PPS ("separate", the
-    default, not agreed), not run at all ("exclude"), or counted as any other
-    ("include").
+    default, protocol v2 decision 7), not run at all ("exclude"), or counted as
+    any other ("include").
     """
     seeds = list(seeds)
     baseline = statistics.median(run(build(), frame, seed) for seed in seeds)
