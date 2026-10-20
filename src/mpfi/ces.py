@@ -34,6 +34,11 @@ if TYPE_CHECKING:
 
 # Noise stays small enough to be a disturbance rather than a different dataset.
 NOISE_SCALE = 0.1
+# A categorical column has no spread to scale noise to; this share of its rows is
+# redrawn. Jenga corrupts a chosen fraction of a column's rows the same way
+# (Schelter et al., EDBT 2021, section 2.2).
+CATEGORY_NOISE_SHARE = 0.1
+MISSING_CATEGORY = "__ces_missing__"
 
 # Moving a knob that only changes how fast a tree is built says nothing about
 # fragility, so the settings that carry the model's behaviour come first.
@@ -225,37 +230,82 @@ def relative_shift(baseline: float, perturbed: float) -> float:
     return abs(baseline - perturbed) / abs(baseline)
 
 
+def _categorical(values: "pd.Series") -> bool:
+    import pandas as pd
+
+    return not pd.api.types.is_numeric_dtype(values)
+
+
+def _with_category(values: "pd.Series", category: str) -> "pd.Series":
+    import pandas as pd
+
+    if (
+        isinstance(values.dtype, pd.CategoricalDtype)
+        and category not in values.cat.categories
+    ):
+        return values.cat.add_categories([category])
+    return values
+
+
 def mean_imputation(
     frame: "pd.DataFrame", column: str, rng: "np.random.Generator | None" = None
 ) -> "pd.DataFrame":
-    """The column loses everything but its average."""
+    """The column loses everything but its average; a categorical one, its mode."""
+    import pandas as pd
+
     disturbed = frame.copy()
-    disturbed[column] = frame[column].mean()
+    values = frame[column]
+    if _categorical(values):
+        disturbed[column] = pd.Series(
+            values.mode().iloc[0], index=values.index, dtype=values.dtype
+        )
+    else:
+        disturbed[column] = values.mean()
     return disturbed
 
 
 def zero_fill(
     frame: "pd.DataFrame", column: str, rng: "np.random.Generator | None" = None
 ) -> "pd.DataFrame":
+    """A constant outside the data: zero, or a category the column never had."""
+    import pandas as pd
+
     disturbed = frame.copy()
-    disturbed[column] = 0
+    values = frame[column]
+    if _categorical(values):
+        dtype = _with_category(values, MISSING_CATEGORY).dtype
+        disturbed[column] = pd.Series(MISSING_CATEGORY, index=values.index, dtype=dtype)
+    else:
+        disturbed[column] = 0
     return disturbed
 
 
 def gaussian_noise(
     frame: "pd.DataFrame", column: str, rng: "np.random.Generator | None" = None
 ) -> "pd.DataFrame":
-    """Noise scaled to the column's own spread, so every column is disturbed alike."""
+    """Noise scaled to the column's own spread, so every column is disturbed alike.
+
+    A categorical column has no spread; there a share of the rows draws its value
+    anew from the column itself, so the distribution stays and the rows lose theirs.
+    """
     import numpy as np
+    import pandas as pd
 
     generator = rng if rng is not None else np.random.default_rng()
-    spread = float(frame[column].std())
+    disturbed = frame.copy()
+    values = frame[column]
+    if _categorical(values):
+        rows = generator.choice(
+            len(frame), round(CATEGORY_NOISE_SHARE * len(frame)), replace=False
+        )
+        redrawn = values.to_numpy(copy=True)
+        redrawn[rows] = generator.choice(values.to_numpy(), len(rows))
+        disturbed[column] = pd.Series(redrawn, index=values.index, dtype=values.dtype)
+        return disturbed
+    spread = float(values.std())
     if spread == 0:
         spread = 1.0
-    disturbed = frame.copy()
-    disturbed[column] = frame[column] + generator.normal(
-        0, NOISE_SCALE * spread, len(frame)
-    )
+    disturbed[column] = values + generator.normal(0, NOISE_SCALE * spread, len(frame))
     return disturbed
 
 

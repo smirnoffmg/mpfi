@@ -201,3 +201,46 @@ def test_the_old_entry_point_no_longer_stops_at_a_broken_run(frame):
         return 0.8
 
     assert model_sensitivity(breaks_on_zeros, frame, ["signal"], seeds=[0]) >= 0.0
+
+
+@pytest.fixture
+def categories():
+    return pd.DataFrame(
+        {
+            "brand": ["a", "a", "b", "c", "a", "b", "a", "c", "b", "a"] * 3,
+            "signal": np.arange(30, dtype=float),
+        }
+    )
+
+
+def test_a_categorical_column_flattens_to_its_mode(categories):
+    result = mean_imputation(categories, "brand")
+
+    assert set(result["brand"]) == {"a"}
+    assert result["signal"].tolist() == categories["signal"].tolist()
+
+
+def test_zero_fill_gives_a_categorical_column_a_category_it_never_had(categories):
+    result = zero_fill(categories, "brand")
+
+    assert result["brand"].nunique() == 1
+    assert result["brand"].iloc[0] not in set(categories["brand"])
+
+
+def test_categorical_noise_redraws_a_tenth_of_the_rows_from_the_column(categories):
+    first = gaussian_noise(categories, "brand", np.random.default_rng(0))
+    again = gaussian_noise(categories, "brand", np.random.default_rng(0))
+
+    assert first["brand"].tolist() == again["brand"].tolist()
+    assert (first["brand"] != categories["brand"]).sum() <= 3
+    assert set(first["brand"]) <= set(categories["brand"])
+    assert first["signal"].tolist() == categories["signal"].tolist()
+
+
+def test_a_pandas_categorical_keeps_its_dtype_under_every_disturbance(categories):
+    typed = categories.assign(brand=categories["brand"].astype("category"))
+
+    for disturb in (mean_imputation, zero_fill, gaussian_noise):
+        result = disturb(typed, "brand", np.random.default_rng(0))
+        assert isinstance(result["brand"].dtype, pd.CategoricalDtype)
+        assert typed["brand"].tolist() == categories["brand"].tolist()
