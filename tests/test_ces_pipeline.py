@@ -376,3 +376,156 @@ def test_propagation_records_a_variant_that_breaks():
 
     assert [f.perturbation for f in measured.failures] == ["drop:scale"]
     assert measured.score(max, failures="count_as_one") == 1.0
+
+
+@pytest.fixture
+def long_pipeline():
+    return Pipeline(
+        [
+            ("a", StandardScaler()),
+            ("b", MinMaxScaler()),
+            ("c", StandardScaler()),
+            ("d", MinMaxScaler()),
+            ("clf", LogisticRegression(C=1.0)),
+        ]
+    )
+
+
+def test_the_scaled_scheme_drops_half_of_the_steps_at_once_and_then_all(long_pipeline):
+    """Schema S of protocol v2 (E23): the share disturbed does not fall with length."""
+    from mpfi.ces import named_pipeline_perturbations
+
+    variants = named_pipeline_perturbations(long_pipeline, steps="scaled")
+    dropping = [v for v in variants if v.name.startswith(("drop_half:", "drop_all"))]
+
+    assert not [v for v in variants if v.name.startswith("drop:")]
+    halves = [v for v in dropping if v.name.startswith("drop_half:")]
+    assert len(halves) == 4  # of the six halves of four steps
+    assert len({v.steps for v in halves}) == len(halves)
+    for variant in halves:
+        assert len(variant.steps) == 2
+        assert names(variant.pipeline) == [
+            n for n in names(long_pipeline) if n not in variant.steps
+        ]
+    (whole,) = [v for v in dropping if v.name == "drop_all"]
+    assert names(whole.pipeline) == ["clf"]
+    assert any(v.name.startswith("swap:") for v in variants)
+
+
+def test_the_scaled_scheme_draws_the_same_subsets_every_time(long_pipeline):
+    from mpfi.ces import named_pipeline_perturbations
+
+    def listed():
+        return [
+            v.name for v in named_pipeline_perturbations(long_pipeline, steps="scaled")
+        ]
+
+    first, again = listed(), listed()
+
+    assert first == again
+
+
+def test_a_half_that_is_the_whole_chain_is_not_run_twice():
+    from mpfi.ces import named_pipeline_perturbations
+
+    single = Pipeline([("scale", StandardScaler()), ("clf", LogisticRegression())])
+    dropping = [
+        v.name
+        for v in named_pipeline_perturbations(single, steps="scaled")
+        if v.name.startswith("drop")
+    ]
+
+    assert dropping == ["drop_all"]
+
+
+def test_a_dropped_subset_with_a_sampler_is_evaluation():
+    from mpfi.ces import named_pipeline_perturbations
+
+    sampled = Pipeline(
+        [
+            ("scale", StandardScaler()),
+            ("smote", Resampler()),
+            ("clf", LogisticRegression()),
+        ]
+    )
+    kinds = {
+        v.name: (v.kind, v.steps)
+        for v in named_pipeline_perturbations(sampled, steps="scaled")
+    }
+
+    assert kinds["drop_all"][0] == "evaluation"
+    for name, (kind, touched) in kinds.items():
+        if name.startswith("drop_half:"):
+            assert kind == ("evaluation" if "smote" in touched else "pipeline")
+
+
+def test_one_step_at_a_time_stays_the_default(pipeline):
+    from mpfi.ces import named_pipeline_perturbations
+
+    found = {v.name for v in named_pipeline_perturbations(pipeline)}
+
+    assert {"drop:scale", "drop:shrink"} <= found
+    assert not any(n.startswith(("drop_half:", "drop_all")) for n in found)
+
+
+def test_a_short_chain_gets_every_half_it_has():
+    from mpfi.ces import named_pipeline_perturbations
+
+    two = Pipeline(
+        [("a", StandardScaler()), ("b", MinMaxScaler()), ("clf", LogisticRegression())]
+    )
+    found = {v.name for v in named_pipeline_perturbations(two, steps="scaled")}
+
+    assert {"drop_half:a", "drop_half:b", "drop_all"} <= found
+
+
+def _moved(pipe, **kwargs):
+    from mpfi.ces import named_pipeline_perturbations
+
+    return {
+        v.name for v in named_pipeline_perturbations(pipe, **kwargs) if "×" in v.name
+    }
+
+
+def test_a_wrapped_model_has_its_settings_found_inside_the_wrapper():
+    from sklearn.ensemble import BaggingClassifier
+    from sklearn.tree import DecisionTreeClassifier
+
+    wrapped = Pipeline(
+        [("clf", BaggingClassifier(estimator=DecisionTreeClassifier(max_depth=3)))]
+    )
+
+    assert _moved(wrapped) == {
+        "clf.estimator__max_depth×0.8",
+        "clf.estimator__max_depth×1.2",
+        "clf.estimator__min_samples_leaf×1.2",
+    }
+
+
+def test_seeds_and_folds_are_never_moved_for_want_of_a_setting():
+    """Moving a seed is reseeding, and the floor already measures that."""
+    FoldAverage = _booster("FoldAverage", random_state=0, n_splits=5, cv_seed=3)
+
+    assert _moved(Pipeline([("clf", FoldAverage())])) == set()
+
+
+def test_settings_a_search_tunes_are_left_to_the_search():
+    from sklearn.model_selection import GridSearchCV
+    from sklearn.tree import DecisionTreeClassifier
+
+    searched = Pipeline(
+        [("clf", GridSearchCV(DecisionTreeClassifier(), {"max_depth": [2, 3]}))]
+    )
+
+    moved = _moved(searched)
+    assert not any("max_depth" in name for name in moved)
+    assert "clf.estimator__min_samples_leaf×1.2" in moved
+
+
+def test_an_adapter_can_name_the_settings_to_move():
+    Shares = _booster("GroupShares", prior_weight=40.0, random_state=0)
+
+    assert _moved(Pipeline([("clf", Shares())]), model_params=("prior_weight",)) == {
+        "clf.prior_weight×0.8",
+        "clf.prior_weight×1.2",
+    }

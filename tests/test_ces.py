@@ -244,3 +244,37 @@ def test_a_pandas_categorical_keeps_its_dtype_under_every_disturbance(categories
         result = disturb(typed, "brand", np.random.default_rng(0))
         assert isinstance(result["brand"].dtype, pd.CategoricalDtype)
         assert typed["brand"].tolist() == categories["brand"].tolist()
+
+
+def test_noise_comes_in_a_ladder_of_doses():
+    from mpfi.ces import NOISE_DOSES, NOISE_SCALE
+
+    assert NOISE_DOSES == (0.01, 0.03, 0.1, 0.3, 1.0)
+    assert NOISE_SCALE in NOISE_DOSES
+
+
+def test_every_dose_moves_the_column_along_the_same_draws(frame):
+    """Common random numbers: one seed gives one direction, the dose its length."""
+    small = gaussian_noise(frame, "signal", np.random.default_rng(0), scale=0.01)
+    large = gaussian_noise(frame, "signal", np.random.default_rng(0), scale=1.0)
+
+    np.testing.assert_allclose(
+        (large["signal"] - frame["signal"]).to_numpy(),
+        100 * (small["signal"] - frame["signal"]).to_numpy(),
+    )
+
+
+def test_the_default_dose_is_the_one_used_so_far(frame):
+    default = gaussian_noise(frame, "signal", np.random.default_rng(0))
+    explicit = gaussian_noise(frame, "signal", np.random.default_rng(0), scale=0.1)
+
+    assert default["signal"].tolist() == explicit["signal"].tolist()
+
+
+def test_categorical_noise_redraws_a_share_of_rows_equal_to_the_dose():
+    unique = pd.DataFrame({"brand": [f"b{i}" for i in range(1000)]})
+
+    for dose in (0.03, 0.3, 1.0):
+        result = gaussian_noise(unique, "brand", np.random.default_rng(0), scale=dose)
+        changed = int((result["brand"] != unique["brand"]).sum())
+        assert 0.9 * dose * 1000 <= changed <= dose * 1000

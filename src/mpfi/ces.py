@@ -22,6 +22,8 @@ The secondary outcome is the relative shift of the quality the pipeline reports
 """
 
 import itertools
+import math
+import random
 import statistics
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -34,6 +36,10 @@ if TYPE_CHECKING:
 
 # Noise stays small enough to be a disturbance rather than a different dataset.
 NOISE_SCALE = 0.1
+# Protocol v2 measures noise as a ladder of doses and takes the area under the
+# churn curve: at one dose the order of pipelines depends on the dose chosen
+# (E57: rank correlation 0.47 between 0.1σ and 1σ, 0.8–0.9 between neighbours).
+NOISE_DOSES = (0.01, 0.03, 0.1, 0.3, 1.0)
 # A categorical column has no spread to scale noise to; this share of its rows is
 # redrawn. Jenga corrupts a chosen fraction of a column's rows the same way
 # (Schelter et al., EDBT 2021, section 2.2).
@@ -281,12 +287,20 @@ def zero_fill(
 
 
 def gaussian_noise(
-    frame: "pd.DataFrame", column: str, rng: "np.random.Generator | None" = None
+    frame: "pd.DataFrame",
+    column: str,
+    rng: "np.random.Generator | None" = None,
+    scale: float = NOISE_SCALE,
 ) -> "pd.DataFrame":
-    """Noise scaled to the column's own spread, so every column is disturbed alike.
+    """Noise of `scale` times the column's spread, so every column is disturbed alike.
 
     A categorical column has no spread; there a share of the rows draws its value
     anew from the column itself, so the distribution stays and the rows lose theirs.
+    The share grows with the dose as the spread does: CATEGORY_NOISE_SHARE at the
+    default dose, every row at a dose of one spread.
+
+    One generator seed gives every dose the same draws, only scaled, so the churn
+    of a column changes smoothly along the ladder of NOISE_DOSES.
     """
     import numpy as np
     import pandas as pd
@@ -295,9 +309,8 @@ def gaussian_noise(
     disturbed = frame.copy()
     values = frame[column]
     if _categorical(values):
-        rows = generator.choice(
-            len(frame), round(CATEGORY_NOISE_SHARE * len(frame)), replace=False
-        )
+        share = min(1.0, CATEGORY_NOISE_SHARE * scale / NOISE_SCALE)
+        rows = generator.choice(len(frame), round(share * len(frame)), replace=False)
         redrawn = values.to_numpy(copy=True)
         redrawn[rows] = generator.choice(values.to_numpy(), len(rows))
         disturbed[column] = pd.Series(redrawn, index=values.index, dtype=values.dtype)
@@ -305,7 +318,7 @@ def gaussian_noise(
     spread = float(values.std())
     if spread == 0:
         spread = 1.0
-    disturbed[column] = values + generator.normal(0, NOISE_SCALE * spread, len(frame))
+    disturbed[column] = values + generator.normal(0, scale * spread, len(frame))
     return disturbed
 
 
@@ -387,13 +400,46 @@ def ces(model_sensitivity_score: float, pipeline_propagation_score: float) -> fl
 
 def drop_step(pipeline: "Pipeline", name: str) -> "Pipeline | None":
     """Remove a transformer. The last step is the estimator and has to stay."""
+    return drop_steps(pipeline, (name,))
+
+
+def drop_steps(pipeline: "Pipeline", names: Iterable[str]) -> "Pipeline | None":
+    """Remove several transformers at once; the estimator has to stay."""
     from sklearn.base import clone
 
     steps = list(pipeline.steps)
-    if name == steps[-1][0] or name not in {step for step, _ in steps}:
+    dropped = set(names)
+    if not dropped or steps[-1][0] in dropped or not dropped <= {s for s, _ in steps}:
         return None
-    kept = [(step, obj) for step, obj in steps if step != name]
+    kept = [(step, obj) for step, obj in steps if step not in dropped]
     return clone(pipeline).set_params(steps=[(s, clone(o)) for s, o in kept])
+
+
+StepScheme = Literal["one_at_a_time", "scaled"]
+# Schema S of protocol v2 (E23): one step at a time lets the share of a long
+# chain that is disturbed shrink with its length, and the median over such
+# variants then falls with length whatever the pipeline (E21, E42, E46).
+HALF_SUBSETS = 4
+
+
+def _scaled_drops(names: Sequence[str]) -> list[tuple[str, ...]]:
+    """K different halves of the transformers, or all there are, then all of them.
+
+    The draw is seeded by the step names, so planning and running a pipeline in
+    two processes list the same subsets.
+    """
+    if not names:
+        return []
+    whole = tuple(names)
+    halves = [
+        h
+        for h in itertools.combinations(names, math.ceil(len(names) / 2))
+        if h != whole
+    ]
+    if len(halves) > HALF_SUBSETS:
+        drawn = random.Random(",".join(names)).sample(range(len(halves)), HALF_SUBSETS)
+        halves = [halves[i] for i in sorted(drawn)]
+    return [*halves, whole]
 
 
 def swap_steps(pipeline: "Pipeline", index: int) -> "Pipeline | None":
@@ -482,7 +528,7 @@ def scale_hyperparameter(
     from sklearn.base import clone
 
     copy = clone(pipeline)
-    current = copy.named_steps[step].get_params().get(parameter)
+    current = copy.named_steps[step].get_params(deep=True).get(parameter)
     if current is None:
         current = default
     if not isinstance(current, int | float) or isinstance(current, bool):
@@ -612,10 +658,60 @@ def leaf_setting(model: Any) -> tuple[str, float | None] | None:
     return None if name is None else (name, None)
 
 
+def _searched(
+    settings: Mapping[str, Any], owners: Sequence[tuple[str, Any]]
+) -> set[str]:
+    """Settings a hyperparameter search sets itself; moving them changes nothing."""
+    tuned: set[str] = set()
+    for prefix, owner in owners:
+        grid = getattr(owner, "param_grid", None) or getattr(
+            owner, "param_distributions", None
+        )
+        for part in grid if isinstance(grid, list) else [grid] if grid else []:
+            tuned |= {f"{prefix}estimator__{name}" for name in part}
+    return tuned & set(settings)
+
+
+def model_settings(model: Any) -> list[tuple[str, float | None]]:
+    """The settings of the estimator to move, looked for inside wrappers as well.
+
+    The first INFLUENTIAL_SETTINGS found among the deep parameters — those of a
+    model inside a fold average, a stack or a search — and the leaf size of the
+    first model `leaf_setting` knows. A setting a search tunes is left out, and so
+    is everything else: a seed or a fold count moved for want of a setting would
+    be reseeding, which the noise floor already measures. Returns paths with the
+    value the library uses for an unset one.
+    """
+    settings = model.get_params(deep=True)
+    owners = [("", model)] + [
+        (f"{key}__", value)
+        for key, value in settings.items()
+        if hasattr(value, "get_params") and not isinstance(value, type)
+    ]
+    tuned = _searched(settings, owners)
+    influential = [
+        key
+        for name in INFLUENTIAL_SETTINGS
+        for key, value in settings.items()
+        if key.split("__")[-1] == name and _numeric(value) and key not in tuned
+    ]
+    chosen: list[tuple[str, float | None]] = [(key, None) for key in influential[:1]]
+    for prefix, owner in owners:
+        leaf = leaf_setting(owner)
+        if leaf is None or f"{prefix}{leaf[0]}" in tuned:
+            continue
+        if f"{prefix}{leaf[0]}" not in influential[:1]:
+            chosen.append((f"{prefix}{leaf[0]}", leaf[1]))
+        break
+    return chosen
+
+
 def named_pipeline_perturbations(
     pipeline: "Pipeline",
     drop_columns: Iterable[str] = (),
     evaluation_steps: Iterable[str] = (),
+    steps: StepScheme = "one_at_a_time",
+    model_params: Sequence[str] = (),
 ) -> list[PipelineVariant]:
     """Every stage disturbed once: preprocessing, ordering, and the estimator.
 
@@ -627,14 +723,27 @@ def named_pipeline_perturbations(
     `drop_columns` names features to take away right before the model.
     `evaluation_steps` adds steps to treat like samplers, beyond those found by
     their `fit_resample`.
+    `model_params` names the estimator's settings to move instead of those
+    `model_settings` finds, for a model whose settings it cannot see.
+    `steps="scaled"` replaces dropping one transformer at a time by schema S:
+    `drop_half:` random halves of the transformers, and `drop_all`.
     """
     evaluation = _samplers(pipeline) | set(evaluation_steps)
     names = [name for name, _ in pipeline.steps]
     estimator = names[-1]
     found: list[tuple[str, Pipeline | None, tuple[str, ...], bool]] = []
 
-    for name in names[:-1]:
-        found.append((f"drop:{name}", drop_step(pipeline, name), (name,), True))
+    if steps == "scaled":
+        for subset in _scaled_drops(names[:-1]):
+            label = (
+                "drop_all"
+                if subset == tuple(names[:-1])
+                else ("drop_half:" + "+".join(subset))
+            )
+            found.append((label, drop_steps(pipeline, subset), subset, True))
+    else:
+        for name in names[:-1]:
+            found.append((f"drop:{name}", drop_step(pipeline, name), (name,), True))
     for index in range(max(0, len(names) - 2)):
         pair = (names[index], names[index + 1])
         found.append(
@@ -650,14 +759,11 @@ def named_pipeline_perturbations(
         found.append((f"replace_scaler:{top}", scaled, (top,), True))
 
     model = pipeline.named_steps[estimator]
-    settings = model.get_params()
-    moved = [
-        name for name in INFLUENTIAL_SETTINGS if _numeric(settings.get(name))
-    ] or sorted(name for name, value in settings.items() if _numeric(value))
-    chosen: list[tuple[str, float | None]] = [(name, None) for name in moved[:1]]
-    leaf = leaf_setting(model)
-    if leaf is not None and leaf[0] not in moved[:1]:
-        chosen.append(leaf)
+    chosen = (
+        [(name, None) for name in model_params]
+        if model_params
+        else model_settings(model)
+    )
     for parameter, default in chosen:
         for factor in (0.8, 1.2):
             found.append(
