@@ -324,6 +324,246 @@ def gaussian_noise(
 
 PERTURBATIONS: tuple[Perturbation, ...] = (mean_imputation, zero_fill, gaussian_noise)
 
+# Candidates for the catalogue, screened against the rule preregistered in E73
+# (masters/experiments/2026-10-29-catalog-screening/hypothesis.md). They stay out of
+# PERTURBATIONS until a type passes, so a queue planned before keeps its spec. Each
+# corrupts a share of the rows, as JENGA does, except precision loss (the literature
+# rounds the whole column) and the probe. `others` are the MSS columns in order of
+# mutual information; a candidate that needs a partner takes the next like column.
+CANDIDATE_SHARE = 0.1
+SENTINEL_NUMBER = -999
+SENTINEL_CATEGORY = "?"
+OUTLIER_SPREADS = 10.0
+UNIT_FACTORS = (10, 100, 1000)
+SLICE_QUANTILE = 0.9
+SIGNIFICANT_DIGITS = 2
+PROBE_FACTOR = 1000
+
+
+def _rows(
+    frame: "pd.DataFrame", rng: "np.random.Generator", share: float
+) -> "np.ndarray":
+    return rng.choice(len(frame), round(share * len(frame)), replace=False)
+
+
+def _number(frame: "pd.DataFrame", column: str) -> "pd.Series":
+    values = frame[column]
+    if _categorical(values):
+        raise PerturbationNotApplicable(f"{column} is not numeric")
+    return values
+
+
+def _partner(frame: "pd.DataFrame", column: str, others: Sequence[str]) -> str:
+    """The next of `others` after `column`, wrapping around, of the same kind."""
+    kind = _categorical(frame[column])
+    order = list(others)
+    start = order.index(column) + 1 if column in order else 0
+    for candidate in order[start:] + order[:start]:
+        if candidate != column and _categorical(frame[candidate]) == kind:
+            return candidate
+    raise PerturbationNotApplicable(f"no MSS column like {column} to pair with")
+
+
+def _spread(values: "pd.Series") -> float:
+    spread = float(values.std())
+    return spread if spread > 0 else 1.0
+
+
+def _put(
+    frame: "pd.DataFrame", column: str, rows: "np.ndarray", value: Any
+) -> "pd.DataFrame":
+    """`value` into `rows` of a copy of the column.
+
+    The column widens only as far as the value needs: an integer column that still
+    holds whole numbers and no gaps stays integer, since adapters pick columns by dtype.
+    """
+    import pandas as pd
+
+    disturbed = frame.copy()
+    values = frame[column]
+    if isinstance(values.dtype, pd.CategoricalDtype):
+        incoming = pd.unique(pd.Series(value).dropna())
+        new = [v for v in incoming if v not in values.cat.categories]
+        disturbed[column] = values.cat.add_categories(new) if new else values
+    elif _categorical(values):
+        disturbed[column] = values.astype(object)
+    else:
+        disturbed[column] = values.astype(float)
+    position = disturbed.columns.get_loc(column)
+    assert isinstance(position, int), f"{column} is not a unique column"
+    disturbed.iloc[rows, position] = value
+    result = disturbed[column]
+    if pd.api.types.is_integer_dtype(values) and result.notna().all():
+        if (result == result.round()).all():
+            disturbed[column] = result.astype(values.dtype)
+    return disturbed
+
+
+def partial_missing(
+    frame: "pd.DataFrame",
+    column: str,
+    rng: "np.random.Generator",
+    others: Sequence[str] = (),
+    share: float = CANDIDATE_SHARE,
+) -> "pd.DataFrame":
+    """A share of the rows, drawn at random, lose their value (MCAR)."""
+    return _put(frame, column, _rows(frame, rng, share), None)
+
+
+def partial_missing_mnar(
+    frame: "pd.DataFrame",
+    column: str,
+    rng: "np.random.Generator",
+    others: Sequence[str] = (),
+    share: float = CANDIDATE_SHARE,
+) -> "pd.DataFrame":
+    """The largest values go missing: missingness that depends on the value (MNAR)."""
+    import numpy as np
+
+    values = _number(frame, column).to_numpy(dtype=float)
+    order = np.argsort(-values, kind="stable")
+    return _put(frame, column, order[: round(share * len(frame))], np.nan)
+
+
+def sentinel(
+    frame: "pd.DataFrame",
+    column: str,
+    rng: "np.random.Generator",
+    others: Sequence[str] = (),
+    share: float = CANDIDATE_SHARE,
+) -> "pd.DataFrame":
+    """A placeholder stands in for the value: −999, or "?" in a categorical column."""
+    value = SENTINEL_CATEGORY if _categorical(frame[column]) else SENTINEL_NUMBER
+    return _put(frame, column, _rows(frame, rng, share), value)
+
+
+def outliers(
+    frame: "pd.DataFrame",
+    column: str,
+    rng: "np.random.Generator",
+    others: Sequence[str] = (),
+    share: float = CANDIDATE_SHARE,
+) -> "pd.DataFrame":
+    """A share of the rows jump OUTLIER_SPREADS spreads off the median, either way."""
+    values = _number(frame, column)
+    rows = _rows(frame, rng, share)
+    signs = rng.choice([-1.0, 1.0], len(rows))
+    far = float(values.median()) + signs * OUTLIER_SPREADS * _spread(values)
+    return _put(frame, column, rows, far)
+
+
+def unit_error(
+    frame: "pd.DataFrame",
+    column: str,
+    rng: "np.random.Generator",
+    others: Sequence[str] = (),
+    share: float = CANDIDATE_SHARE,
+) -> "pd.DataFrame":
+    """A share of the rows recorded in another unit: ×10, ×100 or ×1000 by row."""
+    values = _number(frame, column)
+    rows = _rows(frame, rng, share)
+    factors = rng.choice(UNIT_FACTORS, len(rows))
+    return _put(frame, column, rows, values.to_numpy()[rows] * factors)
+
+
+def slice_offset(
+    frame: "pd.DataFrame",
+    column: str,
+    rng: "np.random.Generator",
+    others: Sequence[str] = (),
+    share: float = CANDIDATE_SHARE,
+) -> "pd.DataFrame":
+    """A systematic error on a slice: +1 spread where the partner is in its top decile.
+
+    The slice is fixed by the partner's distribution, so `share` does not apply.
+    """
+    import numpy as np
+
+    values = _number(frame, column)
+    partner = frame[_partner(frame, column, others)]
+    rows = np.flatnonzero(partner >= partner.quantile(SLICE_QUANTILE))
+    return _put(frame, column, rows, values.to_numpy()[rows] + _spread(values))
+
+
+def precision_loss(
+    frame: "pd.DataFrame",
+    column: str,
+    rng: "np.random.Generator",
+    others: Sequence[str] = (),
+    share: float = CANDIDATE_SHARE,
+) -> "pd.DataFrame":
+    """The whole column keeps SIGNIFICANT_DIGITS significant digits."""
+    import numpy as np
+
+    values = _number(frame, column).to_numpy(dtype=float)
+    magnitude = np.floor(np.log10(np.abs(np.where(values == 0, 1.0, values))))
+    factor = 10.0 ** (SIGNIFICANT_DIGITS - 1 - magnitude)
+    disturbed = frame.copy()
+    disturbed[column] = np.round(values * factor) / factor
+    return disturbed
+
+
+def column_swap(
+    frame: "pd.DataFrame",
+    column: str,
+    rng: "np.random.Generator",
+    others: Sequence[str] = (),
+    share: float = CANDIDATE_SHARE,
+) -> "pd.DataFrame":
+    """A share of the rows have the column's value and its partner's exchanged."""
+    partner = _partner(frame, column, others)
+    rows = _rows(frame, rng, share)
+    mine = frame[column].to_numpy()[rows]
+    theirs = frame[partner].to_numpy()[rows]
+    return _put(_put(frame, column, rows, theirs), partner, rows, mine)
+
+
+def category_typo(
+    frame: "pd.DataFrame",
+    column: str,
+    rng: "np.random.Generator",
+    others: Sequence[str] = (),
+    share: float = CANDIDATE_SHARE,
+) -> "pd.DataFrame":
+    """A share of the rows misspelt, case swapped and a "~" added: new categories."""
+    values = frame[column]
+    if not _categorical(values):
+        raise PerturbationNotApplicable(f"{column} is not categorical")
+    rows = _rows(frame, rng, share)
+    typos = [f"{value}".swapcase() + "~" for value in values.to_numpy()[rows]]
+    return _put(frame, column, rows, typos)
+
+
+def monotone_scale(
+    frame: "pd.DataFrame",
+    column: str,
+    rng: "np.random.Generator",
+    others: Sequence[str] = (),
+    share: float = CANDIDATE_SHARE,
+) -> "pd.DataFrame":
+    """The probe: the whole column ×PROBE_FACTOR.
+
+    A tree split on the column alone does not move; predictions change only where the
+    pipeline mixes the column with others (sums, ratios, a shared scaler, PCA).
+    """
+    disturbed = frame.copy()
+    disturbed[column] = _number(frame, column) * PROBE_FACTOR
+    return disturbed
+
+
+CANDIDATES: tuple[Callable[..., "pd.DataFrame"], ...] = (
+    partial_missing,
+    partial_missing_mnar,
+    sentinel,
+    outliers,
+    unit_error,
+    slice_offset,
+    precision_loss,
+    column_swap,
+    category_typo,
+    monotone_scale,
+)
+
 
 def measure_model_sensitivity(
     run: Run,
