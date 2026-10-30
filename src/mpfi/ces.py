@@ -343,7 +343,9 @@ PROBE_FACTOR = 1000
 def _rows(
     frame: "pd.DataFrame", rng: "np.random.Generator", share: float
 ) -> "np.ndarray":
-    return rng.choice(len(frame), round(share * len(frame)), replace=False)
+    # A prefix of one permutation, so a larger share corrupts every row a smaller one
+    # does (E75). E73 drew with rng.choice, which does not nest (mpfi df50ee6).
+    return rng.permutation(len(frame))[: round(share * len(frame))]
 
 
 def _number(frame: "pd.DataFrame", column: str) -> "pd.Series":

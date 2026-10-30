@@ -245,3 +245,15 @@ def test_an_integer_column_stays_integer_unless_it_gains_a_gap_or_a_fraction():
     assert unit_error(counts, "n", rng())["n"].dtype == "int64"
     assert partial_missing(counts, "n", rng())["n"].dtype == "float64"
     assert outliers(counts, "n", rng())["n"].dtype == "float64"
+
+
+@pytest.mark.parametrize("disturb", [sentinel, column_swap])
+def test_a_larger_share_corrupts_every_row_a_smaller_one_does(frame, disturb):
+    rows = [
+        disturb(frame, "x", rng(), others=["x", "y"], share=share)["x"] != frame["x"]
+        for share in (0.01, 0.1, 0.3, 0.5)
+    ]
+
+    assert [int(r.sum()) for r in rows] == [10, 100, 300, 500]
+    for smaller, larger in zip(rows, rows[1:]):
+        assert not (smaller & ~larger).any()
